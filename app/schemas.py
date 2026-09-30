@@ -115,6 +115,16 @@ class ScanBatchCreate(BaseModel):
     scans: list[ScanCreate] = Field(..., min_length=1)
 
 
+class OffsetSetIn(BaseModel):
+    # Strict ints only: JSON floats (including whole-valued 5.0), booleans
+    # and numeric strings are rejected (HTTP 422) rather than coerced.
+    # Bounds match the Postgres INTEGER column (~68 years is plenty for a
+    # clock offset) so out-of-range values also 422 instead of overflowing.
+    offset_seconds: int = Field(
+        ..., strict=True, ge=-2_147_483_648, le=2_147_483_647
+    )
+
+
 # --------------------------------------------------------------------------
 # Outputs
 # --------------------------------------------------------------------------
@@ -162,6 +172,7 @@ class UsedScanOut(BaseModel):
     point: str
     scan_no: str
     occurred_at: datetime
+    calibrated_at: Optional[datetime] = None
     segment_seconds: float
 
 
@@ -191,6 +202,23 @@ class ScanBatchItem(BaseModel):
     error: Optional[str] = None
     detail: Optional[str] = None
     scan: Optional[ScanOut] = None
+
+
+class PointOffsetOut(BaseModel):
+    point: str
+    offset_seconds: int
+    updated_at: Optional[datetime] = None
+
+
+class OffsetSetOut(PointOffsetOut):
+    replaced: bool = False
+
+
+class OffsetListOut(BaseModel):
+    race_id: str
+    sealed: bool
+    offsets_version: int
+    offsets: list[PointOffsetOut]
 
 
 class ErrorBody(BaseModel):

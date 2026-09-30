@@ -56,8 +56,29 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$RACE_ID/scan
 echo "## provisional results"
 curl -fsS "$BASE_URL/races/$RACE_ID/results"; echo
 
-echo "## revoke a scan"
+echo "## point clock offsets (unset points read back as zero)"
+curl -fsS "$BASE_URL/races/$RACE_ID/points/offsets"; echo
+curl -fsS "$BASE_URL/races/$RACE_ID/points/C1/offset"; echo
+
+echo "## set C1 clock 30 s slow (201 on first set, 200 on replace)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": -30}'
+
+echo "## fractional / whole-valued float offsets are rejected (422)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 0.5}'
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 1.0}'
+
+echo "## results now show calibrated_at alongside raw occurred_at"
+curl -fsS "$BASE_URL/races/$RACE_ID/results"; echo
+
+echo "## reset the offset to zero, then revoke a scan"
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 0}'
 curl -fsS -X DELETE "$BASE_URL/races/$RACE_ID/scans/S2"; echo
 
-echo "## seal (snapshot frozen; later submit/revoke get 409)"
+echo "## seal (snapshot frozen; later submit/revoke/offset changes get 409)"
 curl -fsS -X POST "$BASE_URL/races/$RACE_ID/seal"; echo
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 5}'

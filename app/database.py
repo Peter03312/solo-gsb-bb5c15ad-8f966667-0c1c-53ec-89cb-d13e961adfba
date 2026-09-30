@@ -12,10 +12,13 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     UniqueConstraint,
     create_engine,
+    inspect,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import (
@@ -62,6 +65,11 @@ class Race(Base):
     sealed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Bumped on every accepted point-offset change; provisional results are
+    # recomputed against the same committed scans and this offset version.
+    offsets_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
 
     points: Mapped[list["Point"]] = relationship(
         back_populates="race",
@@ -80,6 +88,9 @@ class Race(Base):
         back_populates="race", cascade="all, delete-orphan"
     )
     snapshots: Mapped[list["ResultSnapshot"]] = relationship(
+        back_populates="race", cascade="all, delete-orphan"
+    )
+    point_offsets: Mapped[list["PointOffset"]] = relationship(
         back_populates="race", cascade="all, delete-orphan"
     )
 
@@ -101,6 +112,38 @@ class Point(Base):
     __table_args__ = (
         UniqueConstraint("race_id", "position", name="uq_point_race_position"),
         UniqueConstraint("race_id", "code", name="uq_point_race_code"),
+    )
+
+
+class PointOffset(Base):
+    """Signed integer-second clock offset configured for one race point.
+
+    A row exists only after staff set/replaced an offset for the point; a
+    missing row is treated as an offset of zero. ``calibrated_at`` of a scan
+    is computed as ``occurred_at + offset``.
+    """
+
+    __tablename__ = "point_offsets"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    race_id: Mapped[str] = mapped_column(
+        UUID(as_uuid=False), ForeignKey("races.id", ondelete="CASCADE"), nullable=False
+    )
+    point_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("race_points.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    offset_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    race: Mapped[Race] = relationship(back_populates="point_offsets")
+    point: Mapped[Point] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("race_id", "point_id", name="uq_offset_race_point"),
     )
 
 
@@ -228,3 +271,14 @@ def init_db(max_retries: int = 30, delay_seconds: float = 1.0) -> None:
         raise RuntimeError(f"database not reachable: {last_error}")
 
     Base.metadata.create_all(bind=engine)
+    # Lightweight forward migration for databases created before point
+    # clock offsets existed (create_all never alters existing tables).
+    with engine.begin() as conn:
+        race_columns = {c["name"] for c in inspect(conn).get_columns("races")}
+        if "offsets_version" not in race_columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE races "
+                    "ADD COLUMN offsets_version INTEGER NOT NULL DEFAULT 0"
+                )
+            )

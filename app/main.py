@@ -13,6 +13,10 @@ from . import service
 from .database import SessionLocal, init_db
 from .schemas import (
     ErrorBody,
+    OffsetListOut,
+    OffsetSetIn,
+    OffsetSetOut,
+    PointOffsetOut,
     RaceCreate,
     RaceOut,
     RunnerResultOut,
@@ -37,8 +41,9 @@ app = FastAPI(
     lifespan=lifespan,
     description=(
         "Race configuration, out-of-order chip scan ingestion with "
-        "idempotent replay/conflict detection, provisional results, scan "
-        "revocation and sealing of a frozen result snapshot."
+        "idempotent replay/conflict detection, per-point signed integer "
+        "clock offsets, provisional results recomputed from calibrated "
+        "times, scan revocation and sealing of a frozen result snapshot."
     ),
 )
 
@@ -141,6 +146,58 @@ def revoke_scan(
 ) -> dict:
     scan = service.revoke_scan(db, race_id, scan_no)
     return service.serialize_scan(scan)
+
+
+# --------------------------------------------------------------------------
+# Point clock offsets
+# --------------------------------------------------------------------------
+
+
+@app.get(
+    "/races/{race_id}/points/offsets",
+    response_model=OffsetListOut,
+    tags=["offsets"],
+)
+def list_point_offsets(race_id: str, db: Session = Depends(get_db)) -> dict:
+    return service.list_offsets(db, race_id)
+
+
+@app.get(
+    "/races/{race_id}/points/{point_code}/offset",
+    response_model=PointOffsetOut,
+    tags=["offsets"],
+    responses={404: {"model": ErrorBody}},
+)
+def get_point_offset(
+    race_id: str, point_code: str, db: Session = Depends(get_db)
+) -> dict:
+    return service.get_point_offset(db, race_id, point_code)
+
+
+@app.put(
+    "/races/{race_id}/points/{point_code}/offset",
+    response_model=OffsetSetOut,
+    tags=["offsets"],
+    responses={
+        200: {"model": OffsetSetOut, "description": "existing offset replaced"},
+        201: {"model": OffsetSetOut, "description": "offset set for the first time"},
+        404: {"model": ErrorBody},
+        409: {"model": ErrorBody},
+        422: {"model": ErrorBody},
+    },
+)
+def set_point_offset(
+    race_id: str,
+    point_code: str,
+    payload: OffsetSetIn,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict:
+    payload_out, replaced = service.set_point_offset(
+        db, race_id, point_code, payload.offset_seconds
+    )
+    response.status_code = 200 if replaced else 201
+    return payload_out
 
 
 # --------------------------------------------------------------------------

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Optional
 
@@ -15,7 +15,16 @@ from sqlalchemy.orm import Session, selectinload
 from .adjudication import Scan as DomainScan
 from .adjudication import Segment as DomainSegment
 from .adjudication import adjudicate_runner
-from .database import Point, Race, ResultSnapshot, Runner, Scan, SegmentRow, utcnow
+from .database import (
+    Point,
+    PointOffset,
+    Race,
+    ResultSnapshot,
+    Runner,
+    Scan,
+    SegmentRow,
+    utcnow,
+)
 from .schemas import RaceCreate, ScanCreate
 
 
@@ -196,10 +205,25 @@ def create_race(db: Session, payload: RaceCreate) -> Race:
 
 
 def get_race_locked(db: Session, race_id: str) -> Race:
-    """Race row with SELECT ... FOR UPDATE (serialises scan/seal/withdraw)."""
+    """Race row with SELECT ... FOR UPDATE (serialises all mutating ops).
+
+    The race row lock serialises scan submit/revoke, point-offset changes
+    and sealing, so a sealed snapshot always matches committed scans and
+    offset versions.
+    """
 
     race_id = _valid_uuid(race_id, what="race_id")
-    race = db.get(Race, race_id, with_for_update=True)
+    race = db.get(
+        Race,
+        race_id,
+        with_for_update=True,
+        options=[
+            selectinload(Race.points),
+            selectinload(Race.segments),
+            selectinload(Race.runners),
+            selectinload(Race.point_offsets),
+        ],
+    )
     if race is None:
         raise ApiError(404, "race_not_found", f"race {race_id} does not exist")
     return race
@@ -214,6 +238,7 @@ def get_race(db: Session, race_id: str) -> Race:
             selectinload(Race.points),
             selectinload(Race.segments),
             selectinload(Race.runners),
+            selectinload(Race.point_offsets),
         ],
     )
     if race is None:
@@ -449,6 +474,91 @@ def revoke_scan(db: Session, race_id: str, scan_no: str) -> Scan:
 
 
 # --------------------------------------------------------------------------
+# Point clock offsets
+# --------------------------------------------------------------------------
+
+
+def _serialize_offset(point: Point, offset: Optional[PointOffset]) -> dict:
+    return {
+        "point": point.code,
+        "offset_seconds": offset.offset_seconds if offset is not None else 0,
+        "updated_at": offset.updated_at if offset is not None else None,
+    }
+
+
+def list_offsets(db: Session, race_id: str) -> dict:
+    """Current offset of every point; an unset point is reported as zero."""
+
+    race = get_race(db, race_id)
+    by_point_id = {o.point_id: o for o in race.point_offsets}
+    return {
+        "race_id": str(race.id),
+        "sealed": race.sealed,
+        "offsets_version": race.offsets_version,
+        "offsets": [
+            _serialize_offset(p, by_point_id.get(p.id))
+            for p in sorted(race.points, key=lambda p: p.position)
+        ],
+    }
+
+
+def get_point_offset(db: Session, race_id: str, point_code: str) -> dict:
+    race = get_race(db, race_id)
+    point = next((p for p in race.points if p.code == point_code), None)
+    if point is None:
+        raise ApiError(
+            404, "unknown_point",
+            f"point {point_code!r} does not exist in this race",
+        )
+    offset = next((o for o in race.point_offsets if o.point_id == point.id), None)
+    return _serialize_offset(point, offset)
+
+
+def set_point_offset(
+    db: Session, race_id: str, point_code: str, offset_seconds: int
+) -> tuple[dict, bool]:
+    """Set/replace one point's integer-second offset (201 new, 200 replaced).
+
+    Takes the race row lock so the change is serial with scan submission,
+    revocation and sealing. Provisional results recompute from the same
+    committed scans at the new offset version on the next read; sealed races
+    reject any change and their snapshots stay untouched.
+    """
+
+    race = get_race_locked(db, race_id)
+    if race.sealed:
+        raise ApiError(409, "race_sealed",
+                       "race is sealed; clock offsets cannot be changed")
+
+    point = next((p for p in race.points if p.code == point_code), None)
+    if point is None:
+        raise ApiError(
+            404, "unknown_point",
+            f"point {point_code!r} does not exist in this race",
+        )
+
+    offset = next((o for o in race.point_offsets if o.point_id == point.id), None)
+    replaced = offset is not None
+    if offset is None:
+        offset = PointOffset(
+            race_id=race.id,
+            point_id=point.id,
+            offset_seconds=offset_seconds,
+        )
+        db.add(offset)
+    else:
+        offset.offset_seconds = offset_seconds
+        offset.updated_at = utcnow()
+    race.offsets_version += 1
+    db.commit()
+    db.refresh(offset)
+
+    payload = _serialize_offset(point, offset)
+    payload["replaced"] = replaced
+    return payload, replaced
+
+
+# --------------------------------------------------------------------------
 # Adjudication
 # --------------------------------------------------------------------------
 
@@ -475,6 +585,16 @@ def _runner_results(
         .order_by(Scan.occurred_at, Scan.scan_no)
     ).all()
 
+    # Per-point signed integer-second clock offsets; an unset point (no row)
+    # is treated as zero. Timing rules run on calibrated timestamps.
+    offset_by_point_id = {o.point_id: o.offset_seconds for o in race.point_offsets}
+
+    def _calibrated(scan: Scan) -> datetime:
+        seconds = offset_by_point_id.get(scan.point_id, 0)
+        if seconds:
+            return scan.occurred_at + timedelta(seconds=seconds)
+        return scan.occurred_at
+
     by_runner: dict[str, list[Scan]] = {}
     for scan in active_scans:
         by_runner.setdefault(scan.runner_id, []).append(scan)
@@ -488,6 +608,7 @@ def _runner_results(
                 scan_no=s.scan_no,
                 point_position=position_by_id[s.point_id],
                 occurred_at=s.occurred_at,
+                calibrated_at=_calibrated(s),
             )
             for s in runner_scans
         ]
@@ -503,6 +624,9 @@ def _runner_results(
                 "point": point_by_scan_no[u.scan_no].code,
                 "scan_no": u.scan_no,
                 "occurred_at": u.occurred_at,
+                "calibrated_at": (
+                    u.calibrated_at if u.calibrated_at is not None else u.occurred_at
+                ),
                 "segment_seconds": u.segment_seconds,
             }
             for u in result.used_scans
@@ -520,8 +644,8 @@ def _runner_results(
             }
         )
 
-    # Finished first by earliest finish, then lex-min scan-no sequence;
-    # DNF afterwards by bib.
+    # Finished first by earliest calibrated finish, then lex-min scan-no
+    # sequence; DNF afterwards by bib.
     used_map = {
         r["runner_id"]: [u["scan_no"] for u in r["used_scans"]]
         for r in results
@@ -553,6 +677,7 @@ def live_results(db: Session, race_id: str) -> dict:
         "name": race.name,
         "sealed": False,
         "sealed_at": None,
+        "offsets_version": race.offsets_version,
         "results": _runner_results(db, race),
     }
 
@@ -568,6 +693,7 @@ def runner_result(db: Session, race_id: str, runner_id: str) -> dict:
             "name": race.name,
             "sealed": False,
             "sealed_at": None,
+            "offsets_version": race.offsets_version,
             "results": _runner_results(db, race),
         }
     for item in payload["results"]:
@@ -607,6 +733,7 @@ def seal_race(db: Session, race_id: str) -> dict:
         "name": race.name,
         "sealed": True,
         "sealed_at": sealed_at,
+        "offsets_version": race.offsets_version,
         "results": _json_safe(results),
     }
 
@@ -623,5 +750,6 @@ def sealed_results_payload(db: Session, race: Race) -> dict:
         "name": race.name,
         "sealed": True,
         "sealed_at": race.sealed_at,
+        "offsets_version": race.offsets_version,
         "results": payloads,
     }

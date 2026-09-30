@@ -15,8 +15,12 @@ The script walks through every requirement:
      unknown chip / unknown point rejection
   4. provisional results: earliest valid finish, lex-min scan-no tiebreak,
      did-not-finish cases
+  4b. per-point signed integer-second clock offsets: query (unset == zero),
+      set/replace, non-integer and unknown-point rejection, provisional
+      results recomputed from calibrated times while raw times are kept
   5. revoke a scan before sealing -> provisional result recomputed
-  6. seal the race -> frozen snapshot; afterwards submit/revoke are rejected
+  6. seal the race -> frozen snapshot; afterwards submit/revoke and offset
+     changes are rejected, but the snapshot keeps the pre-seal version
 """
 
 from __future__ import annotations
@@ -257,6 +261,115 @@ def main() -> None:
     assert by_bib["C03"]["status"] == "did_not_finish"
     print("ok Carol DNF (segment outside allowed interval)")
 
+    # ------------------------------------------------------------------ #
+    step("4b. Point clock offsets: query, calibrate, recompute, reject")
+    # ------------------------------------------------------------------ #
+    # Fresh race: every point reports offset zero (unset == zero).
+    status, body = request("GET", f"{rp}/points/offsets")
+    show(status, body)
+    expect(200, status, "list all point offsets")
+    assert [(o["point"], o["offset_seconds"]) for o in body["offsets"]] == [
+        ("C1", 0), ("C2", 0), ("FIN", 0),
+    ]
+    assert body["offsets_version"] == 0
+    v0 = body["offsets_version"]
+
+    status, body = request("GET", f"{rp}/points/C2/offset")
+    expect(200, status, "get one point offset (unset -> zero)")
+    assert body["offset_seconds"] == 0 and body["updated_at"] is None
+
+    status, body = request("GET", f"{rp}/points/NOPE/offset")
+    show(status, body)
+    expect(404, status, "unknown point offset query rejected")
+
+    # C2's clock is 60 s slow: raw 20:00 calibrates to 19:00. Carol's
+    # FIN (22:00) is then exactly 3 minutes away: C1(10) -> C2(19) = 9 min
+    # is inside [5,30], and C2(19) -> FIN(22) = 3 min is still below the
+    # 5-minute lower bound, so she stays DNF.
+    status, body = request(
+        "PUT", f"{rp}/points/C2/offset", {"offset_seconds": -60}
+    )
+    show(status, body)
+    expect(201, status, "first set of C2 offset (new -> 201)")
+    assert body["offset_seconds"] == -60 and body["replaced"] is False
+
+    status, results = request("GET", f"{rp}/results")
+    assert results["offsets_version"] == v0 + 1
+    by_bib = {r["bib"]: r for r in results["results"]}
+    assert by_bib["C03"]["status"] == "did_not_finish"
+    print("ok C2 offset -60 alone does not make Carol's path valid")
+
+    # FIN clock also 60 s slow: C2(19) -> FIN(21) calibrated, gap exactly
+    # 300 s -> valid closed-interval boundary; finish calibrates to 21:00,
+    # still inside the 60-minute cutoff.
+    status, body = request(
+        "PUT", f"{rp}/points/FIN/offset", {"offset_seconds": -60}
+    )
+    expect(201, status, "first set of FIN offset")
+
+    status, body = request("GET", f"{rp}/points/FIN/offset")
+    expect(200, status, "get one point offset (set value)")
+    assert body["offset_seconds"] == -60 and body["updated_at"] is not None
+
+    status, results = request("GET", f"{rp}/results")
+    show(status, results)
+    assert results["offsets_version"] == v0 + 2
+    by_bib = {r["bib"]: r for r in results["results"]}
+    carol = by_bib["C03"]
+    assert carol["status"] == "finished"
+    assert carol["finish_time"] == at(21), carol["finish_time"]
+    assert carol["total_seconds"] == 21 * 60
+    used = {u["point"]: u for u in carol["used_scans"]}
+    # Raw scan timestamps are kept; calibrated timestamps are shown too.
+    assert used["C2"]["occurred_at"] == at(20)
+    assert used["C2"]["calibrated_at"] == at(19)
+    assert used["FIN"]["occurred_at"] == at(22)
+    assert used["FIN"]["calibrated_at"] == at(21)
+    assert used["C2"]["segment_seconds"] == 9 * 60
+    assert used["FIN"]["segment_seconds"] == 3 * 60
+    print("ok Carol finishes after C2/FIN calibration (raw kept, calibrated shown)")
+
+    # C2/FIN offsets shift Alice's and Dan's calibrated finishes to 29:00,
+    # while Carol calibrates to 21:00: the ranking is Carol, then Alice,
+    # then Dan (Alice vs Dan tie at 29:00 breaks on scan-no sequence).
+    assert by_bib["A01"]["finish_time"] == at(29)
+    assert by_bib["D04"]["finish_time"] == at(29)
+    assert carol["rank"] == 1
+    assert by_bib["A01"]["rank"] == 2
+    assert by_bib["D04"]["rank"] == 3
+    print("ok ranking recomputed from calibrated finish times")
+
+    # Non-integer offsets are explicitly rejected, including whole floats.
+    status, body = request(
+        "PUT", f"{rp}/points/C1/offset", {"offset_seconds": 0.5}
+    )
+    show(status, body)
+    expect(422, status, "fractional offset rejected")
+    status, body = request(
+        "PUT", f"{rp}/points/C1/offset", {"offset_seconds": 1.0}
+    )
+    expect(422, status, "whole-valued float (1.0) rejected as non-integer")
+    status, body = request(
+        "PUT", f"{rp}/points/NOPE/offset", {"offset_seconds": 5}
+    )
+    show(status, body)
+    expect(404, status, "unknown point offset set rejected")
+
+    # Replacing C2's offset is HTTP 200 with replaced=true. Reset C2/FIN to
+    # zero so the remainder of the demo sees the original adjudication.
+    status, body = request(
+        "PUT", f"{rp}/points/C2/offset", {"offset_seconds": 0}
+    )
+    show(status, body)
+    expect(200, status, "replacing an existing offset -> 200 replaced=true")
+    assert body["replaced"] is True
+    request("PUT", f"{rp}/points/FIN/offset", {"offset_seconds": 0})
+    status, results = request("GET", f"{rp}/results")
+    by_bib = {r["bib"]: r for r in results["results"]}
+    assert by_bib["C03"]["status"] == "did_not_finish"
+    assert results["offsets_version"] == v0 + 4
+    print("ok reset offsets -> provisional results recompute to original")
+
     assert by_bib["D04"]["status"] == "finished"
     assert [u["scan_no"] for u in by_bib["D04"]["used_scans"]] == [
         "DA01", "DB01", "DC01"
@@ -322,6 +435,24 @@ def main() -> None:
     status, body = request("DELETE", f"{rp}/scans/BATCH-1")
     show(status, body)
     expect(409, status, "revocation after sealing rejected")
+
+    # Offset changes are rejected after sealing; the snapshot (computed at
+    # the pre-seal offset version, zero) is unaffected.
+    status, body = request(
+        "PUT", f"{rp}/points/C1/offset", {"offset_seconds": 30}
+    )
+    show(status, body)
+    expect(409, status, "offset change after sealing rejected")
+
+    # Offset queries still work and keep reporting the frozen version.
+    status, body = request("GET", f"{rp}/points/offsets")
+    expect(200, status, "offsets still queryable after sealing")
+    assert body["sealed"] is True
+    assert all(o["offset_seconds"] == 0 for o in body["offsets"])
+
+    status, body = request("GET", f"{rp}/results")
+    assert body["offsets_version"] == v0 + 4
+    print("ok sealed snapshot keeps the pre-seal offset version")
 
     print("\nALL DEMO STEPS PASSED")
 
