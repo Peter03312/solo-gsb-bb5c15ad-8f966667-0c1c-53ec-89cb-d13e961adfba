@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     UniqueConstraint,
@@ -95,6 +96,12 @@ class Point(Base):
     code: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     is_finish: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Signed integer seconds added to every raw scan at this point before
+    # adjudication (device clock skew correction). Unset is equivalent to 0;
+    # mutable until the race is sealed.
+    offset_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     race: Mapped[Race] = relationship(back_populates="points")
 

@@ -115,6 +115,21 @@ class ScanBatchCreate(BaseModel):
     scans: list[ScanCreate] = Field(..., min_length=1)
 
 
+class OffsetIn(BaseModel):
+    # Signed integer seconds only: device clocks skew by whole seconds.
+    # pydantic (lax int) rejects fractional values like 60.5 with a 422;
+    # the validator below also rejects booleans, which would otherwise be
+    # silently coerced via Python's bool -> int relationship.
+    offset_seconds: int = Field(..., ge=-86400, le=86400)
+
+    @field_validator("offset_seconds", mode="before")
+    @classmethod
+    def _reject_bool(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("offset_seconds must be an integer, not a boolean")
+        return v
+
+
 # --------------------------------------------------------------------------
 # Outputs
 # --------------------------------------------------------------------------
@@ -126,6 +141,7 @@ class PointOut(BaseModel):
     code: str
     name: str
     is_finish: bool
+    offset_seconds: int
 
 
 class SegmentOut(BaseModel):
@@ -161,8 +177,24 @@ class UsedScanOut(BaseModel):
     segment: int
     point: str
     scan_no: str
-    occurred_at: datetime
+    occurred_at: datetime  # raw device time as submitted
+    calibrated_at: datetime  # occurred_at + point offset
+    offset_seconds: int
     segment_seconds: float
+
+
+class PointOffsetOut(BaseModel):
+    position: int
+    code: str
+    name: str
+    is_finish: bool
+    offset_seconds: int
+
+
+class OffsetsOut(BaseModel):
+    race_id: str
+    sealed: bool
+    offsets: list[PointOffsetOut]
 
 
 class RunnerResultOut(BaseModel):

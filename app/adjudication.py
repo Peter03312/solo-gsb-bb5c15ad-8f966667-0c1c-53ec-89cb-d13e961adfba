@@ -13,17 +13,23 @@ Model
 * A runner may have zero or more scans at each point. Scans may arrive out
   of order. The adjudicator chooses, per runner, a path of exactly one scan
   per point in point order.
+* Every scan carries the raw ``occurred_at`` reported by the point device
+  and the point's signed integer ``offset_seconds``. The *calibrated* time
+  is ``occurred_at + offset_seconds``; an unset offset is simply zero. All
+  adjudication below uses calibrated times, while the raw occurrence time
+  is preserved on each used scan for reporting.
 * A path is *valid* when:
-  - used scan instants are strictly increasing by occurrence time from one
-    scan to the next (``occurred_at`` of scan i is strictly greater than
+  - used scan instants are strictly increasing by calibrated time from one
+    scan to the next (calibrated time of scan i is strictly greater than
     that of scan i-1);
   - every segment duration (measured from the race start for the first
-    segment, from the previous used scan afterwards) lies inside the
-    configured closed interval — a first segment with lower bound 0 may
-    therefore be stamped exactly at the start instant;
-  - the finish scan is not later than the race cutoff.
-* Among valid paths the one with the earliest finish instant wins; ties are
-  broken by the lexicographically smallest tuple of scan numbers.
+    segment, from the previous used scan afterwards, both calibrated) lies
+    inside the configured closed interval — a first segment with lower
+    bound 0 may therefore be stamped exactly at the start instant;
+  - the calibrated finish scan is not later than the race cutoff.
+* Among valid paths the one with the earliest calibrated finish instant
+  wins; ties are broken by the lexicographically smallest tuple of scan
+  numbers.
 * Without any valid complete path the runner is "did_not_finish".
 """
 
@@ -32,7 +38,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 @dataclass(frozen=True)
@@ -52,12 +58,19 @@ class Scan:
     """One chip observation at a point.
 
     ``point_position`` is the 1-based position of the point (1 = first
-    checkpoint, n = finish).
+    checkpoint, n = finish). ``occurred_at`` is the raw device time; the
+    point's signed integer ``offset_seconds`` (default 0) is added to it to
+    obtain the calibrated time used for adjudication.
     """
 
     scan_no: str
     point_position: int
     occurred_at: datetime
+    offset_seconds: int = 0
+
+    @property
+    def calibrated_at(self) -> datetime:
+        return _normalise(self.occurred_at) + timedelta(seconds=self.offset_seconds)
 
 
 @dataclass(frozen=True)
@@ -65,7 +78,9 @@ class UsedScan:
     segment_position: int
     point_position: int
     scan_no: str
-    occurred_at: datetime
+    occurred_at: datetime  # raw device time, as submitted
+    calibrated_at: datetime  # occurred_at + point offset
+    offset_seconds: int
     segment_seconds: float
 
 
@@ -97,10 +112,11 @@ def _valid_edge(
 ) -> Optional[float]:
     """Return the segment duration in seconds when the edge is valid.
 
+    All instants here are calibrated (raw scan time plus its point offset).
     The start -> first-point edge is governed solely by its closed interval
-    (so ``min=0`` allows a scan stamped exactly at the start instant). Every
-    later edge joins two scans and must additionally satisfy the strict
-    increase of occurrence times.
+    (so ``min=0`` allows a scan calibrated exactly to the start instant).
+    Every later edge joins two scans and must additionally satisfy the
+    strict increase of calibrated times.
     """
 
     elapsed = (occurred_at - previous_time).total_seconds()
@@ -142,17 +158,17 @@ def adjudicate_runner(
 
     point_count = len(segments)
 
-    # Group candidate scans by point; sort deterministically by time then
-    # scan number so equal-time ties resolve identically everywhere.
+    # Group candidate scans by point; sort deterministically by calibrated
+    # time then scan number so equal-time ties resolve identically.
     layers: dict[int, list[Scan]] = {p: [] for p in range(1, point_count + 1)}
     for scan in scans:
         if 1 <= scan.point_position <= point_count:
             layers[scan.point_position].append(scan)
     for layer in layers.values():
-        layer.sort(key=lambda s: (_normalise(s.occurred_at), s.scan_no))
+        layer.sort(key=lambda s: (s.calibrated_at, s.scan_no))
 
     # Layer 0 is the virtual start: fixed time, empty scan sequence.
-    # state: scan_no -> (occurred_at, sequence tuple, tuple[UsedScan])
+    # state: scan_no -> (calibrated time, sequence tuple, tuple[UsedScan])
     states: dict[str, tuple[datetime, tuple[str, ...], tuple[UsedScan, ...]]] = {
         "__start__": (race_start, (), ())
     }
@@ -164,10 +180,11 @@ def adjudicate_runner(
         ] = {}
 
         for scan in layers[position]:
-            happened = _normalise(scan.occurred_at)
+            raw_time = _normalise(scan.occurred_at)
+            happened = scan.calibrated_at
             if position == point_count and happened > cutoff:
-                # A finish scan after cutoff can never belong to a valid
-                # path; skip it early.
+                # A calibrated finish scan after cutoff can never belong to
+                # a valid path; skip it early.
                 continue
 
             best: Optional[
@@ -192,7 +209,9 @@ def adjudicate_runner(
                             segment_position=position,
                             point_position=position,
                             scan_no=scan.scan_no,
-                            occurred_at=happened,
+                            occurred_at=raw_time,
+                            calibrated_at=happened,
+                            offset_seconds=scan.offset_seconds,
                             segment_seconds=elapsed,
                         ),
                     ),
@@ -219,7 +238,8 @@ def adjudicate_runner(
                 reason=f"no_valid_path_to_point_{position}",
             )
 
-    # Finish layer: earliest finish time, then lex-min scan-number sequence.
+    # Finish layer: earliest calibrated finish time, then lex-min scan-no
+    # sequence.
     winner: Optional[
         tuple[datetime, tuple[str, ...], tuple[UsedScan, ...]]
     ] = None

@@ -28,11 +28,12 @@ def segments(minutes):
     ]
 
 
-def sc(no, pos, minute, second=0):
+def sc(no, pos, minute, second=0, offset=0):
     return Scan(
         scan_no=no,
         point_position=pos,
         occurred_at=T0 + timedelta(minutes=minute, seconds=second),
+        offset_seconds=offset,
     )
 
 
@@ -155,6 +156,87 @@ def test_irrelevant_point_scans_ignored():
     scans = [sc("1", 1, 10), sc("x", 5, 12), sc("2", 2, 20)]
     r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
     check("ignore", [u.scan_no for u in r.used_scans], ["1", "2"])
+
+
+def test_point_offset_calibrates_segment_and_finish():
+    # Raw path 10/20/30 min is valid; with the FIN clock 120s slow the
+    # calibrated finish lands at 32 min: segment and finish move together.
+    segs = segments([(5, 40), (5, 40), (5, 40)])
+    scans = [
+        sc("10", 1, 10),
+        sc("20", 2, 20),
+        sc("30", 3, 30, offset=120),
+    ]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("status", r.status, "finished")
+    check("calibrated finish", r.finish_time,
+          T0 + timedelta(minutes=32))
+    check("total calibrated", r.total_seconds, 32 * 60.0)
+    fin = r.used_scans[2]
+    # Raw time is retained, calibrated time and the offset are shown.
+    check("raw kept", fin.occurred_at, T0 + timedelta(minutes=30))
+    check("calibrated shown", fin.calibrated_at, T0 + timedelta(minutes=32))
+    check("offset shown", fin.offset_seconds, 120)
+    check("calibrated segment secs", fin.segment_seconds, 12 * 60.0)
+
+
+def test_offset_rescues_out_of_interval_and_cutoff():
+    # Raw FIN at 31 min violates both the 10-min C2->FIN max and the 30-min
+    # cutoff; a +120s correction on the slow FIN device moves it to 29.
+    segs = segments([(5, 30), (5, 30), (5, 10)])
+    cutoff30 = T0 + timedelta(minutes=30)
+    scans = [
+        sc("10", 1, 10),
+        sc("20", 2, 20),
+        sc("31", 3, 31, offset=-120),
+    ]
+    r = adjudicate_runner(
+        race_start=T0, cutoff=cutoff30, segments=segs, scans=scans
+    )
+    check("rescued", r.status, "finished")
+    check("finish at cutoff minus 1min", r.finish_time,
+          T0 + timedelta(minutes=29))
+
+
+def test_negative_offset_can_invalidate_path():
+    # Raw 10/20/30 is valid; C2 runs 120s fast, so calibrated C2 is 18 min:
+    # C1->C2 is only 8 min (< 10 min lower bound) -> no valid path.
+    segs = segments([(5, 30), (10, 30), (5, 30)])
+    scans = [
+        sc("10", 1, 10),
+        sc("20", 2, 20, offset=-120),
+        sc("30", 3, 30),
+    ]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("offset dnf", r.status, "did_not_finish")
+
+
+def test_strict_increase_uses_calibrated_times():
+    # Raw timestamps increase by one minute, but offsets pull them to the
+    # same calibrated instant -> strict increase fails -> DNF.
+    segs = segments([(0, 30), (0, 30)])
+    scans = [
+        sc("1", 1, 10, offset=60),    # calibrated 11:00
+        sc("2", 2, 11, offset=0),     # calibrated 11:00
+    ]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("calibrated tie dnf", r.status, "did_not_finish")
+
+
+def test_earliest_finish_ranks_by_calibrated_time():
+    # Two complete paths finish at the same point: "a" finishes at raw 24,
+    # "b" at raw 23 but its device runs 120s fast (calibrated 25). The
+    # calibrated-earliest path wins even though its raw time is later.
+    segs = segments([(5, 40), (5, 40)])
+    scans = [
+        sc("a1", 1, 10),
+        sc("a2", 2, 24),                       # calibrated 24
+        sc("b1", 1, 10),
+        sc("b2", 2, 23, offset=120),           # raw 23 -> calibrated 25
+    ]
+    r = adjudicate_runner(race_start=T0, cutoff=CUTOFF, segments=segs, scans=scans)
+    check("calibrated earliest wins",
+          [u.scan_no for u in r.used_scans], ["a1", "a2"])
 
 
 def _run_all():

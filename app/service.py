@@ -15,8 +15,16 @@ from sqlalchemy.orm import Session, selectinload
 from .adjudication import Scan as DomainScan
 from .adjudication import Segment as DomainSegment
 from .adjudication import adjudicate_runner
-from .database import Point, Race, ResultSnapshot, Runner, Scan, SegmentRow, utcnow
-from .schemas import RaceCreate, ScanCreate
+from .database import (
+    Point,
+    Race,
+    ResultSnapshot,
+    Runner,
+    Scan,
+    SegmentRow,
+    utcnow,
+)
+from .schemas import OffsetIn, RaceCreate, ScanCreate
 
 
 class ApiError(Exception):
@@ -73,6 +81,7 @@ def serialize_race(race: Race) -> dict:
                 "code": p.code,
                 "name": p.name,
                 "is_finish": p.is_finish,
+                "offset_seconds": p.offset_seconds,
             }
             for p in sorted(race.points, key=lambda p: p.position)
         ],
@@ -449,6 +458,84 @@ def revoke_scan(db: Session, race_id: str, scan_no: str) -> Scan:
 
 
 # --------------------------------------------------------------------------
+# Point clock offsets
+# --------------------------------------------------------------------------
+
+
+def _serialize_point_offset(point: Point) -> dict:
+    return {
+        "position": point.position,
+        "code": point.code,
+        "name": point.name,
+        "is_finish": point.is_finish,
+        "offset_seconds": int(point.offset_seconds),
+    }
+
+
+def list_offsets(db: Session, race_id: str) -> dict:
+    """Return the current signed-integer offset of every point.
+
+    Offsets remain readable after sealing; they are part of the frozen
+    configuration snapshot.
+    """
+
+    race = get_race(db, race_id)
+    return {
+        "race_id": str(race.id),
+        "sealed": race.sealed,
+        "offsets": [
+            _serialize_point_offset(p)
+            for p in sorted(race.points, key=lambda p: p.position)
+        ],
+    }
+
+
+def _get_point_of_race(db: Session, race: Race, point_code: str) -> Point:
+    point = db.scalars(
+        select(Point).where(
+            Point.race_id == race.id, Point.code == point_code
+        )
+    ).first()
+    if point is None:
+        raise ApiError(404, "unknown_point",
+                       f"point {point_code!r} does not exist in this race")
+    return point
+
+
+def set_point_offset(
+    db: Session, race_id: str, point_code: str, payload: OffsetIn
+) -> dict:
+    """Set or replace one point's signed-integer seconds offset.
+
+    Takes the same race row lock as scan submission/revocation/sealing, so
+    an offset change is serialised against all of them. Provisional results
+    are recomputed from the already committed scans at read time, which
+    means they immediately reflect the new offset version. Sealed races
+    reject the change; the sealed snapshot is never touched.
+    """
+
+    race = get_race_locked(db, race_id)
+    if race.sealed:
+        raise ApiError(409, "race_sealed",
+                       "race is sealed; point offsets cannot change")
+
+    point = _get_point_of_race(db, race, point_code)
+    point.offset_seconds = payload.offset_seconds
+    db.commit()
+
+    points = db.scalars(
+        select(Point)
+        .where(Point.race_id == race.id)
+        .order_by(Point.position)
+    ).all()
+    return {
+        "race_id": str(race.id),
+        "sealed": False,
+        "offsets": [_serialize_point_offset(p) for p in points],
+    }
+
+
+# --------------------------------------------------------------------------
 # Adjudication
 # --------------------------------------------------------------------------
 
@@ -460,6 +547,7 @@ def _runner_results(
     points = sorted(race.points, key=lambda p: p.position)
     point_by_id = {p.id: p for p in points}
     position_by_id = {p.id: p.position for p in points}
+    offset_by_id = {p.id: int(p.offset_seconds) for p in points}
     segments = [
         DomainSegment(
             position=s.position,
@@ -488,6 +576,7 @@ def _runner_results(
                 scan_no=s.scan_no,
                 point_position=position_by_id[s.point_id],
                 occurred_at=s.occurred_at,
+                offset_seconds=offset_by_id[s.point_id],
             )
             for s in runner_scans
         ]
@@ -503,6 +592,8 @@ def _runner_results(
                 "point": point_by_scan_no[u.scan_no].code,
                 "scan_no": u.scan_no,
                 "occurred_at": u.occurred_at,
+                "calibrated_at": u.calibrated_at,
+                "offset_seconds": u.offset_seconds,
                 "segment_seconds": u.segment_seconds,
             }
             for u in result.used_scans

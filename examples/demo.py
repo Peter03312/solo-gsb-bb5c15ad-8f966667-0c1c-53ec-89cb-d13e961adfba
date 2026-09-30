@@ -16,7 +16,10 @@ The script walks through every requirement:
   4. provisional results: earliest valid finish, lex-min scan-no tiebreak,
      did-not-finish cases
   5. revoke a scan before sealing -> provisional result recomputed
-  6. seal the race -> frozen snapshot; afterwards submit/revoke are rejected
+  6. point clock offsets: signed integer seconds, raw vs calibrated times,
+     immediate recompute, non-integer/unknown-point rejection
+  7. seal the race -> frozen snapshot; afterwards submit/revoke/offset are
+     rejected
 """
 
 from __future__ import annotations
@@ -37,6 +40,15 @@ CUTOFF = T0 + timedelta(hours=1)
 
 def at(minute: int, second: int = 0) -> str:
     return (T0 + timedelta(minutes=minute, seconds=second)).isoformat()
+
+
+def same_instant(a: str, b: str) -> bool:
+    """Compare two ISO-8601 instants regardless of Z vs +00:00 spelling."""
+
+    def norm(x: str) -> datetime:
+        return datetime.fromisoformat(x.replace("Z", "+00:00"))
+
+    return norm(a) == norm(b)
 
 
 def request(method: str, path: str, body=None):
@@ -295,7 +307,84 @@ def main() -> None:
     expect(404, status, "unknown scan revocation 404")
 
     # ------------------------------------------------------------------ #
-    step("6. Seal the race and verify the frozen snapshot")
+    step("6. Point clock offsets (signed integer seconds)")
+    # ------------------------------------------------------------------ #
+    # Device clocks may drift. Each point keeps a signed INTEGER seconds
+    # offset; adjudication uses occurred_at + offset, while the raw
+    # occurred_at is stored and reported unchanged.
+    status, body = request("GET", f"{rp}/offsets")
+    show(status, body)
+    expect(200, status, "list current offsets")
+    assert [p["offset_seconds"] for p in body["offsets"]] == [0, 0, 0]
+    print("ok unset offsets read back as zero")
+
+    # Non-integer / wrong-type offsets are refused (422).
+    status, body = request(
+        "PUT", f"{rp}/points/C1/offset", {"offset_seconds": 1.5}
+    )
+    show(status, body)
+    expect(422, status, "fractional offset rejected")
+
+    status, body = request(
+        "PUT", f"{rp}/points/C1/offset", {"offset_seconds": True}
+    )
+    expect(422, status, "boolean offset rejected")
+
+    # Unknown race / unknown point are explicit 404s.
+    status, body = request(
+        "PUT", "/races/deadbeef-dead-beef-dead-beefdeadbeef/points/C1/offset",
+        {"offset_seconds": 5},
+    )
+    expect(404, status, "offset on unknown race rejected")
+    status, body = request(
+        "PUT", f"{rp}/points/NOPE/offset", {"offset_seconds": 5}
+    )
+    expect(404, status, "offset on unknown point rejected")
+
+    # Dan (CHIP-D) finished provisionally at 30 min via DA01/DB01/DC01.
+    # Say the FIN device clock runs 30 seconds slow: calibrate it +30s.
+    status, body = request(
+        "PUT", f"{rp}/points/FIN/offset", {"offset_seconds": 30}
+    )
+    show(status, body)
+    expect(200, status, "signed integer offset set/replaced")
+    fin_offset = [p for p in body["offsets"] if p["code"] == "FIN"][0]
+    assert fin_offset["offset_seconds"] == 30
+
+    status, results = request("GET", f"{rp}/results")
+    by_bib = {r["bib"]: r for r in results["results"]}
+    dan = by_bib["D04"]
+    assert dan["status"] == "finished"
+    used_fin = dan["used_scans"][-1]
+    # Raw time preserved, calibrated time and offset shown alongside.
+    assert same_instant(used_fin["occurred_at"], at(30))
+    assert same_instant(used_fin["calibrated_at"], at(30, 30))
+    assert used_fin["offset_seconds"] == 30
+    assert same_instant(dan["finish_time"], at(30, 30))
+    assert dan["total_seconds"] == 30 * 60 + 30
+    print("ok raw occurred_at kept; calibrated_at = raw + 30s used to judge")
+
+    # Replacing the offset back to zero recomputes from the same committed
+    # scans immediately (nothing is re-submitted).
+    request("PUT", f"{rp}/points/FIN/offset", {"offset_seconds": 0})
+    status, results = request("GET", f"{rp}/results")
+    by_bib = {r["bib"]: r for r in results["results"]}
+    assert same_instant(by_bib["D04"]["finish_time"], at(30))
+    print("ok offset replacement immediately recomputes provisional results")
+
+    # A negative offset can invalidate a previously valid path: FIN moved
+    # 10 minutes earlier makes Dan's C2->FIN segment 9 minutes (< 300s).
+    request("PUT", f"{rp}/points/FIN/offset", {"offset_seconds": -600})
+    status, results = request("GET", f"{rp}/results")
+    by_bib = {r["bib"]: r for r in results["results"]}
+    assert by_bib["D04"]["status"] == "did_not_finish"
+    print("ok negative offset moves calibrated finish out of interval -> DNF")
+
+    # Restore zero so the sealed snapshot below is produced at raw times.
+    request("PUT", f"{rp}/points/FIN/offset", {"offset_seconds": 0})
+
+    # ------------------------------------------------------------------ #
+    step("7. Seal the race and verify the frozen snapshot")
     # ------------------------------------------------------------------ #
     status, sealed = request("POST", f"{rp}/seal")
     show(status, sealed)
@@ -322,6 +411,21 @@ def main() -> None:
     status, body = request("DELETE", f"{rp}/scans/BATCH-1")
     show(status, body)
     expect(409, status, "revocation after sealing rejected")
+
+    # Offsets are still readable after sealing, but changes are rejected;
+    # the frozen snapshot keeps the offset version it was sealed with.
+    status, body = request("GET", f"{rp}/offsets")
+    expect(200, status, "offsets still readable after sealing")
+    assert body["sealed"] is True
+    status, body = request(
+        "PUT", f"{rp}/points/FIN/offset", {"offset_seconds": 30}
+    )
+    show(status, body)
+    expect(409, status, "offset change after sealing rejected")
+    status, body = request("GET", f"{rp}/results")
+    by_bib = {r["bib"]: r for r in body["results"]}
+    assert same_instant(by_bib["D04"]["finish_time"], at(30))
+    print("ok sealed snapshot unaffected by the rejected offset change")
 
     print("\nALL DEMO STEPS PASSED")
 

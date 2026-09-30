@@ -13,6 +13,8 @@ from . import service
 from .database import SessionLocal, init_db
 from .schemas import (
     ErrorBody,
+    OffsetIn,
+    OffsetsOut,
     RaceCreate,
     RaceOut,
     RunnerResultOut,
@@ -33,12 +35,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Road Race Split Timing Adjudication Service",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "Race configuration, out-of-order chip scan ingestion with "
-        "idempotent replay/conflict detection, provisional results, scan "
-        "revocation and sealing of a frozen result snapshot."
+        "idempotent replay/conflict detection, per-point signed-integer "
+        "clock offsets, provisional results, scan revocation and sealing "
+        "of a frozen result snapshot."
     ),
 )
 
@@ -146,6 +149,35 @@ def revoke_scan(
 # --------------------------------------------------------------------------
 # Results & sealing
 # --------------------------------------------------------------------------
+
+
+@app.get(
+    "/races/{race_id}/offsets",
+    response_model=OffsetsOut,
+    tags=["offsets"],
+    responses={404: {"model": ErrorBody}},
+)
+def race_offsets(race_id: str, db: Session = Depends(get_db)) -> dict:
+    return service.list_offsets(db, race_id)
+
+
+@app.put(
+    "/races/{race_id}/points/{point_code}/offset",
+    response_model=OffsetsOut,
+    tags=["offsets"],
+    responses={
+        404: {"model": ErrorBody},
+        409: {"model": ErrorBody},
+        422: {"model": ErrorBody},
+    },
+)
+def put_point_offset(
+    race_id: str,
+    point_code: str,
+    payload: OffsetIn,
+    db: Session = Depends(get_db),
+) -> dict:
+    return service.set_point_offset(db, race_id, point_code, payload)
 
 
 @app.get("/races/{race_id}/results", tags=["results"])

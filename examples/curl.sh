@@ -56,8 +56,34 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/races/$RACE_ID/scan
 echo "## provisional results"
 curl -fsS "$BASE_URL/races/$RACE_ID/results"; echo
 
+echo "## point clock offsets (signed integer seconds)"
+# All offsets read as zero until set.
+curl -fsS "$BASE_URL/races/$RACE_ID/offsets"; echo
+# calibrated time = raw occurred_at + offset, so a SLOW clock (30s behind
+# standard time) is corrected with a positive +30s offset.
+curl -fsS -X PUT "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 30}'; echo
+# Results now keep raw occurred_at and additionally show calibrated_at.
+curl -fsS "$BASE_URL/races/$RACE_ID/results"; echo
+# Fractional / non-integer offsets are refused (HTTP 422).
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT \
+  "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 30.5}'
+# Unknown point -> 404.
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT \
+  "$BASE_URL/races/$RACE_ID/points/NOPE/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 0}'
+# Replace back to zero; provisional results recompute immediately.
+curl -fsS -X PUT "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 0}' >/dev/null
+echo "reset C1 offset to 0"
+
 echo "## revoke a scan"
 curl -fsS -X DELETE "$BASE_URL/races/$RACE_ID/scans/S2"; echo
 
-echo "## seal (snapshot frozen; later submit/revoke get 409)"
+echo "## seal (snapshot frozen; later submit/revoke/offset-change get 409)"
 curl -fsS -X POST "$BASE_URL/races/$RACE_ID/seal"; echo
+echo "## offset change after sealing is rejected (HTTP 409)"
+curl -sS -o /dev/null -w '%{http_code}\n' -X PUT \
+  "$BASE_URL/races/$RACE_ID/points/C1/offset" \
+  -H 'Content-Type: application/json' -d '{"offset_seconds": 30}'
